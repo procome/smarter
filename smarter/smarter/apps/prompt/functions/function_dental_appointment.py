@@ -29,7 +29,6 @@ Environment Variables
 
 Signals
 -------
-- llm_tool_presented
 - llm_tool_requested
 - llm_tool_responded
 """
@@ -174,6 +173,10 @@ class DentalSchedulingDB:
     def _appointments(self) -> str:
         return f"{self.table_prefix}appointments"
 
+    @property
+    def _doctors(self) -> str:
+        return f"{self.table_prefix}doctors"
+
     @contextmanager
     def get_cursor(self) -> Iterator[pymysql.cursors.DictCursor]:
         """Context manager: open connection, yield DictCursor, commit or rollback."""
@@ -199,10 +202,12 @@ class DentalSchedulingDB:
     def lookup_patient_appointment(self, patient_name: str, appt_date: str) -> Optional[dict]:
         """Return the active appointment for patient_name on appt_date, or None."""
         query = f"""
-            SELECT a.appointment_id, a.appointment_time, a.appointment_type, a.status
+            SELECT a.appointment_id, a.appointment_time, a.appointment_type, a.status,
+                   d.doctor_name
             FROM   {self._appointments} a
             JOIN   {self._patients}     p ON a.patient_id = p.patient_id
-            WHERE  p.patient_name    = %s
+            LEFT JOIN {self._doctors}   d ON a.doctor_id  = d.doctor_id
+            WHERE  p.patient_name     = %s
               AND  a.appointment_date = %s
               AND  a.status NOT IN ('CANCELLED')
             LIMIT 1
@@ -259,25 +264,28 @@ class DentalSchedulingDB:
             return cursor.lastrowid
 
     def book_appointment(self, patient_id: int, appt_date: str,
-                         appt_time: str, appt_type: str) -> int:
+                         appt_time: str, appt_type: str,
+                         doctor_id: Optional[int] = None) -> int:
         """Insert appointment row. Returns the new appointment_id."""
         query = f"""
             INSERT INTO {self._appointments}
-                (patient_id, appointment_date, appointment_time, appointment_type, status)
-            VALUES (%s, %s, %s, %s, 'SCHEDULED')
+                (patient_id, doctor_id, appointment_date, appointment_time, appointment_type, status)
+            VALUES (%s, %s, %s, %s, %s, 'SCHEDULED')
         """
         with self.get_cursor() as cursor:
-            cursor.execute(query, (patient_id, appt_date, appt_time, appt_type))
+            cursor.execute(query, (patient_id, doctor_id, appt_date, appt_time, appt_type))
             return cursor.lastrowid
 
     def get_appointment(self, appointment_id: int) -> Optional[dict]:
-        """Return appointment row with patient name, or None if not found."""
+        """Return appointment row with patient name and doctor name, or None if not found."""
         query = f"""
             SELECT a.appointment_id, p.patient_name,
                    a.appointment_date, a.appointment_time,
-                   a.appointment_type, a.status
+                   a.appointment_type, a.status,
+                   d.doctor_name
             FROM   {self._appointments} a
             JOIN   {self._patients}     p ON a.patient_id = p.patient_id
+            LEFT JOIN {self._doctors}   d ON a.doctor_id  = d.doctor_id
             WHERE  a.appointment_id = %s
             LIMIT 1
         """
@@ -292,6 +300,49 @@ class DentalSchedulingDB:
                 f"UPDATE {self._appointments} SET status = %s WHERE appointment_id = %s",
                 (status, appointment_id),
             )
+
+    def resolve_doctor(self, doctor_name: str) -> Optional[dict]:
+        """Return {'doctor_id': int, 'doctor_name': str} for an active doctor (case-insensitive), or None."""
+        query = f"""
+            SELECT doctor_id, doctor_name FROM {self._doctors}
+            WHERE LOWER(doctor_name) = LOWER(%s) AND is_active = 1
+            LIMIT 1
+        """
+        with self.get_cursor() as cursor:
+            cursor.execute(query, (doctor_name,))
+            return cursor.fetchone()
+
+    def is_doctor_available(self, doctor_id: int, appt_date: str, appt_time: str) -> bool:
+        """Return True if the doctor has no non-cancelled appointment at the given date/time."""
+        query = f"""
+            SELECT appointment_id FROM {self._appointments}
+            WHERE  doctor_id        = %s
+              AND  appointment_date = %s
+              AND  appointment_time = %s
+              AND  status != 'CANCELLED'
+            LIMIT 1
+        """
+        with self.get_cursor() as cursor:
+            cursor.execute(query, (doctor_id, appt_date, appt_time))
+            return cursor.fetchone() is None
+
+    def get_any_available_doctor(self, appt_date: str, appt_time: str) -> Optional[dict]:
+        """Return any active doctor free at the given date/time, or None."""
+        query = f"""
+            SELECT d.doctor_id, d.doctor_name
+            FROM   {self._doctors} d
+            LEFT JOIN {self._appointments} a
+                ON  a.doctor_id        = d.doctor_id
+                AND a.appointment_date = %s
+                AND a.appointment_time = %s
+                AND a.status != 'CANCELLED'
+            WHERE  d.is_active = 1
+              AND  a.appointment_id IS NULL
+            LIMIT 1
+        """
+        with self.get_cursor() as cursor:
+            cursor.execute(query, (appt_date, appt_time))
+            return cursor.fetchone()
 
 
 dental_db = DentalSchedulingDB()
@@ -316,13 +367,27 @@ def _validate_date(value: str) -> Optional[str]:
     return None
 
 
+_LAST_SLOT_HOUR   = CLINIC_CLOSE_HOUR - 1   # 16
+_LAST_SLOT_MINUTE = 30
+
+
 def _validate_time(value: str) -> Optional[str]:
-    """Return an error string, or None if the time is within clinic hours."""
+    """Return an error string, or None if the time is a valid 30-minute clinic slot."""
     if not TIME_RE.match(value):
         return f"Invalid time format. Expected HH:MM (24-hour), received: '{value}'."
-    hour = int(value.split(":")[0])
-    if not (CLINIC_OPEN_HOUR <= hour < CLINIC_CLOSE_HOUR):
-        return f"Requested time is outside clinic hours ({CLINIC_OPEN_HOUR:02d}:00–{CLINIC_CLOSE_HOUR:02d}:00)."
+    hour, minute = int(value.split(":")[0]), int(value.split(":")[1])
+    outside_hours = (
+        hour < CLINIC_OPEN_HOUR
+        or hour > _LAST_SLOT_HOUR
+        or (hour == _LAST_SLOT_HOUR and minute > _LAST_SLOT_MINUTE)
+    )
+    if outside_hours:
+        return (
+            f"Requested time is outside clinic hours "
+            f"({CLINIC_OPEN_HOUR:02d}:00–{_LAST_SLOT_HOUR:02d}:{_LAST_SLOT_MINUTE:02d})."
+        )
+    if minute not in (0, 30):
+        return "Appointment times must be on the hour or half-hour (e.g. '10:00' or '10:30')."
     return None
 
 
@@ -338,7 +403,7 @@ def dental_appointment(
 
     The 'action' argument selects the operation. Required arguments vary by action:
       lookup  — patient_name, date
-      book    — patient_name, date, time, appointment_type (optional)
+      book    — patient_name, date, time, appointment_type (optional), preferred_doctors (optional)
       confirm — appointment_id
       cancel  — appointment_id, reason (optional)
 
@@ -390,6 +455,7 @@ def dental_appointment(
     )
 
     # ── 4. Dispatch to action handler ─────────────────────────────────────────
+    result = {"error": f"Internal error: unhandled action '{action}'."}
     try:
         if action == DentalAction.LOOKUP:
             result = _handle_lookup(arguments)
@@ -432,19 +498,25 @@ def _handle_lookup(args: dict) -> dict:
 
     row = dental_db.lookup_patient_appointment(patient_name, appt_date)
     if row:
-        return {
-            "status":           AppointmentStatus.FOUND,
-            "patient_name":     patient_name,
-            "date":             appt_date,
-            "appointment_id":   row["appointment_id"],
-            "appointment_time": str(row["appointment_time"]),
-            "appointment_type": row["appointment_type"],
+        appt_time   = str(row["appointment_time"])
+        doctor_name = row.get("doctor_name")
+        result = {
+            "status":             AppointmentStatus.FOUND,
+            "patient_name":       patient_name,
+            "date":               appt_date,
+            "appointment_id":     row["appointment_id"],
+            "time":               appt_time,
+            "appointment_type":   row["appointment_type"],
             "appointment_status": row["status"],
-            "message": (
-                f"{patient_name} has a {row['appointment_type']} "
-                f"at {row['appointment_time']} on {appt_date} (status: {row['status']})."
-            ),
         }
+        if doctor_name:
+            result["doctor"] = doctor_name
+        result["message"] = (
+            f"{patient_name} has a {row['appointment_type']} at {appt_time} on {appt_date}"
+            + (f" with {doctor_name}" if doctor_name else "")
+            + f" (status: {row['status']})."
+        )
+        return result
     return {
         "status":       AppointmentStatus.NOT_FOUND,
         "patient_name": patient_name,
@@ -455,10 +527,11 @@ def _handle_lookup(args: dict) -> dict:
 
 def _handle_book(args: dict) -> dict:
     """Book a new appointment, or return the next available slot."""
-    patient_name     = args.get("patient_name", "").strip()
-    appt_date        = args.get("date", "").strip()
-    appt_time        = args.get("time", "").strip()
-    appointment_type = args.get("appointment_type", AppointmentType.CHECKUP)
+    patient_name      = args.get("patient_name", "").strip()
+    appt_date         = args.get("date", "").strip()
+    appt_time         = args.get("time", "").strip()
+    appointment_type  = args.get("appointment_type", AppointmentType.CHECKUP)
+    preferred_doctors = args.get("preferred_doctors") or []
 
     for name, value in [("patient_name", patient_name), ("date", appt_date), ("time", appt_time)]:
         if not value:
@@ -498,31 +571,57 @@ def _handle_book(args: dict) -> dict:
             ),
         }
 
+    def _pick_doctor(preferred_list: list, a_date: str, a_time: str):
+        """Return (doctor_id, canonical_doctor_name) for the first available preferred doctor,
+        or fall back to any active available doctor. Returns (None, None) if no doctors exist."""
+        for preferred in preferred_list:
+            doc = dental_db.resolve_doctor(preferred)
+            if doc is None:
+                logger.warning("%s preferred_doctors: '%s' not found in doctors table.", logger_prefix, preferred)
+                continue
+            if dental_db.is_doctor_available(doc["doctor_id"], a_date, a_time):
+                return doc["doctor_id"], doc["doctor_name"]
+        fallback = dental_db.get_any_available_doctor(a_date, a_time)
+        if fallback:
+            return fallback["doctor_id"], fallback["doctor_name"]
+        return None, None
+
     if dental_db.is_slot_available(appt_date, appt_time):
+        doctor_id, doctor_name = _pick_doctor(preferred_doctors, appt_date, appt_time)
         patient_id = dental_db.get_or_create_patient(patient_name)
-        appt_id    = dental_db.book_appointment(patient_id, appt_date, appt_time, appointment_type)
-        return {
+        appt_id    = dental_db.book_appointment(patient_id, appt_date, appt_time, appointment_type, doctor_id)
+        result = {
             "status":           AppointmentStatus.BOOKED,
             "appointment_id":   appt_id,
             "patient_name":     patient_name,
-            "appointment_type": appointment_type,
             "date":             appt_date,
             "time":             appt_time,
+            "appointment_type": appointment_type,
         }
+        if doctor_name:
+            result["doctor"] = doctor_name
+        return result
 
     next_slot = dental_db.find_next_available(appt_date, appt_time)
     if next_slot:
-        return {
-            "status":               AppointmentStatus.UNAVAILABLE,
-            "requested_date":       appt_date,
-            "requested_time":       appt_time,
-            "next_available_date":  next_slot["date"],
-            "next_available_time":  next_slot["time"],
-            "message": (
-                f"The {appt_time} slot on {appt_date} is unavailable. "
-                f"Next available: {next_slot['date']} at {next_slot['time']}."
-            ),
+        _, next_doctor_name = _pick_doctor(preferred_doctors, next_slot["date"], next_slot["time"])
+
+        result = {
+            "status":              AppointmentStatus.UNAVAILABLE,
+            "requested_date":      appt_date,
+            "requested_time":      appt_time,
+            "next_available_date": next_slot["date"],
+            "next_available_time": next_slot["time"],
         }
+        if next_doctor_name:
+            result["doctor"] = next_doctor_name
+        result["message"] = (
+            f"The {appt_time} slot on {appt_date} is unavailable. "
+            f"Next available: {next_slot['date']} at {next_slot['time']}"
+            + (f" with {next_doctor_name}" if next_doctor_name else "")
+            + "."
+        )
+        return result
     return {"error": f"No available slots found in the next {BOOKING_WINDOW_DAYS} days. Please call the clinic directly."}
 
 
@@ -545,7 +644,7 @@ def _handle_confirm(args: dict) -> dict:
         return {"error": f"Appointment {appointment_id} is already CANCELLED."}
 
     dental_db.update_appointment_status(appointment_id, AppointmentStatus.CONFIRMED)
-    return {
+    result = {
         "status":           AppointmentStatus.CONFIRMED,
         "appointment_id":   appointment_id,
         "patient_name":     appt["patient_name"],
@@ -553,6 +652,9 @@ def _handle_confirm(args: dict) -> dict:
         "time":             str(appt["appointment_time"]),
         "appointment_type": appt["appointment_type"],
     }
+    if appt.get("doctor_name"):
+        result["doctor"] = appt["doctor_name"]
+    return result
 
 
 def _handle_cancel(args: dict) -> dict:
@@ -573,15 +675,19 @@ def _handle_cancel(args: dict) -> dict:
         return {"error": f"Appointment {appointment_id} is already CANCELLED."}
 
     dental_db.update_appointment_status(appointment_id, AppointmentStatus.CANCELLED)
-    return {
+    result = {
         "status":           AppointmentStatus.CANCELLED,
         "appointment_id":   appointment_id,
         "patient_name":     appt["patient_name"],
         "date":             str(appt["appointment_date"]),
         "time":             str(appt["appointment_time"]),
         "appointment_type": appt["appointment_type"],
-        "reason":           reason,
     }
+    if appt.get("doctor_name"):
+        result["doctor"] = appt["doctor_name"]
+    if reason is not None:
+        result["reason"] = reason
+    return result
 
 
 # ── Tool Factory ──────────────────────────────────────────────────────────────
@@ -613,8 +719,10 @@ def dental_appointment_tool_factory() -> dict:
                 "  book    — schedule a new appointment for a patient.\n"
                 "            Required: patient_name, date, time.\n"
                 "            Optional: appointment_type (defaults to CHECKUP if omitted).\n"
-                "            Returns: status BOOKED (with appointment_id) if the slot is free,\n"
-                "                     or status UNAVAILABLE with the next available date/time,\n"
+                "            Optional: preferred_doctors — list of doctor names tried in priority order;\n"
+                "                     the first available doctor is assigned and returned in the 'doctor' field.\n"
+                "            Returns: status BOOKED (with appointment_id and doctor) if the slot is free,\n"
+                "                     or status UNAVAILABLE with the next available date/time and doctor,\n"
                 "                     or status PENDING_APPROVAL if appointment_type is EMERGENCY.\n"
                 "            Note: always run lookup first to avoid double-booking.\n"
                 "\n"
@@ -638,7 +746,7 @@ def dental_appointment_tool_factory() -> dict:
                         "description": (
                             "The scheduling operation to perform. "
                             "lookup  → patient_name + date. "
-                            "book    → patient_name + date + time [+ appointment_type]. "
+                            "book    → patient_name + date + time [+ appointment_type] [+ preferred_doctors]. "
                             "confirm → appointment_id. "
                             "cancel  → appointment_id [+ reason]."
                         ),
@@ -679,6 +787,19 @@ def dental_appointment_tool_factory() -> dict:
                             "Supported: CHECKUP, CLEANING, XRAY, CONSULTATION, EMERGENCY. "
                             "EMERGENCY requires supervisor pre-approval and will not be booked immediately. "
                             "Optional for: book — defaults to CHECKUP when omitted. "
+                            "Not used for: lookup, confirm, cancel."
+                        ),
+                    },
+                    "preferred_doctors": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Prioritised list of preferred doctor names, e.g. ['Doctor Miller', 'Doctor Wong']. "
+                            "Names must match the doctor_name column of the doctors table (case-insensitive). "
+                            "The tool checks each in order and assigns the first available doctor; "
+                            "if none are free at the requested slot, any active doctor is assigned instead. "
+                            "The assigned doctor is returned in the 'doctor' field of the BOOKED response. "
+                            "Optional for: book. "
                             "Not used for: lookup, confirm, cancel."
                         ),
                     },
